@@ -13,7 +13,7 @@ from triagem_core import APIColab, Config, ErroServidor, processar
 class Aplicativo(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title('Triagem de Imagens com IA | YOLO26 + YOLOE-26 - v7')
+        self.title('Triagem de Imagens com IA | YOLO26 + YOLOE-26 - v8')
         self.geometry('890x750')
         self.minsize(740, 680)
         self.eventos = queue.Queue()
@@ -32,6 +32,7 @@ class Aplicativo(tk.Tk):
         self.limite = tk.StringVar(value='25')
         self.recursivo = tk.BooleanVar(value=True)
         self.simular = tk.BooleanVar(value=True)
+        self.gerar_anotacoes = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value='Pronto. Primeiro teste em simulacao (25 imagens).')
         self.progress = tk.DoubleVar(value=0)
         self.criar_layout()
@@ -80,6 +81,8 @@ class Aplicativo(tk.Tk):
         checks.pack(fill='x',pady=(6,9))
         ttk.Checkbutton(checks,text='Incluir subpastas',variable=self.recursivo).pack(side='left')
         ttk.Checkbutton(checks,text='SIMULAÇÃO: não mover arquivos',variable=self.simular).pack(side='left',padx=30)
+        ttk.Checkbutton(topo, text='Gerar anotações YOLO automaticamente (.txt + dataset ZIP para CVAT)',
+                        variable=self.gerar_anotacoes).pack(anchor='w',pady=(0,5))
         ttk.Label(topo,text='Detecção ≥ confiança alta | Dúvida: entre mínima e alta | Sem detecções: nenhuma classe-alvo ≥ mínima.').pack(anchor='w')
         botoes = ttk.Frame(topo)
         botoes.pack(fill='x',pady=(14,7))
@@ -97,7 +100,7 @@ class Aplicativo(tk.Tk):
         self.log.configure(yscrollcommand=barra.set)
         self.log.pack(side='left',fill='both',expand=True)
         barra.pack(side='right',fill='y')
-        self.logar('Instruções: execute notebook v7 no Colab, copie a URL e X-API-Key para esta janela.')
+        self.logar('Instruções: execute notebook v7 (compatível com V8) no Colab, copie a URL e X-API-Key para esta janela.')
         self.logar('Recomendação: mantenha SIMULAÇÃO marcada e limite 25 no primeiro teste.')
 
     def logar(self, mensagem):
@@ -131,7 +134,8 @@ class Aplicativo(tk.Tk):
                    url=self.url.get().strip(),chave=self.chave.get().strip(),modelo=self.modelo.get(),
                    classes=self.classes.get().strip(),prompts=self.prompts.get().strip(),
                    conf_min=minimo,conf_alta=alto,lote=lote,simular=self.simular.get(),
-                   recursivo=self.recursivo.get(),limite=limite)
+                   recursivo=self.recursivo.get(),limite=limite,
+                   gerar_anotacoes=self.gerar_anotacoes.get())
         c.validar()
         return c
 
@@ -227,12 +231,18 @@ class Aplicativo(tk.Tk):
                         resp = evento[1]
                         self.status.set('Concluído')
                         self.logar('Relatório CSV: '+resp['csv'])
+                        if resp.get('dataset_zip'):
+                            self.logar('Dataset CVAT/YOLO: ' + resp['dataset_zip'])
                         messagebox.showinfo('Triagem concluída',
                                             f"Processadas: {resp['processadas']} / {resp['total']}\n"
                                             f"Detecção: {resp['contagem']['deteccao']}\n"
                                             f"Dúvida: {resp['contagem']['duvida']}\n"
                                             f"Sem detecções: {resp['contagem']['sem_deteccoes']}\n"
-                                            f"Erros: {resp['contagem']['erro']}\n\nCSV: {resp['csv']}")
+                                            f"Erros: {resp['contagem']['erro']}\n"
+                                            f"Imagens pré-anotadas: {resp['contagem']['anotadas']}\n"
+                                            f"Caixas exportadas: {resp['contagem']['caixas_anotadas']}\n\n"
+                                            f"Dataset ZIP: {resp.get('dataset_zip') or 'Não gerado (simulação/sem detecções)'}\n"
+                                            f"CSV: {resp['csv']}")
                     else:
                         self.status.set('Interrompido por erro')
                         self.logar('[ERRO] '+evento[1])

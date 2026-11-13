@@ -9,6 +9,9 @@ import errno
 import hashlib
 import io
 import json
+import math
+import re
+import zipfile
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -25,7 +28,8 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 EXTENSOES = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tif', '.tiff'}
 CAMPOS = ['data_hora', 'execucao', 'status', 'pasta', 'origem', 'destino',
           'confianca_max', 'num_deteccoes', 'classes', 'deteccoes_json', 'erro',
-          'modelo', 'confianca_minima', 'confianca_alta', 'simulacao']
+          'modelo', 'confianca_minima', 'confianca_alta', 'simulacao',
+          'anotacao_gerada', 'anotacao_txt', 'imagem_dataset']
 PASTAS = ('deteccao', 'duvida', 'sem_deteccoes')
 
 
@@ -42,6 +46,7 @@ class Config:
     conf_alta: float = 0.45
     lote: int = 4
     simular: bool = True
+    gerar_anotacoes: bool = False
     recursivo: bool = True
     limite: int = 0  # 0 = todas
 
@@ -122,6 +127,108 @@ def jpeg_em_memoria(path: Path) -> bytes:
             raise ValueError('Imagem enorme: JPEG temporario ainda excede 11 MiB.')
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise ValueError(f'Nao foi possivel decodificar {path.name}: {exc}') from exc
+
+
+def classes_dataset(config: Config, info: dict) -> tuple[dict[int, int], list[str]]:
+    """Mapeia IDs originais do checkpoint para 0..N-1, na ordem selecionada.
+
+    Nunca interpreta ID COCO 7 como ID 7 de um dataset de duas classes.
+    """
+    recebidas = info.get('classes')
+    if not isinstance(recebidas, list):
+        raise ValueError('O Colab nao enviou a lista de classes; confira a versao do notebook.')
+    nomes = {int(item['id']): str(item['name']) for item in recebidas}
+    if config.modelo == 'yolo26':
+        selecionadas = list(dict.fromkeys(int(x.strip()) for x in config.classes.split(',') if x.strip()))
+    else:
+        selecionadas = list(range(len([x.strip() for x in config.prompts.split(',') if x.strip()])))
+    if any(i not in nomes for i in selecionadas):
+        raise ValueError('Alguma classe selecionada nao esta disponivel no modelo: ' + str(selecionadas))
+    return {cid: idx for idx, cid in enumerate(selecionadas)}, [nomes[cid] for cid in selecionadas]
+
+
+def rotulos_yolo(deteccoes: list[dict], ids: dict[int, int], largura: int,
+                 altura: int, conf_min: float) -> list[str]:
+    """Converte coordenadas do JPEG enviado ao Colab em xywh normalizados.
+
+    Mantem apenas classes selecionadas e exige bbox valida. Uma anotacao defeituosa
+    nao deve resultar no movimento da imagem original.
+    """
+    if largura <= 0 or altura <= 0:
+        raise ValueError('Dimensoes invalidas da imagem enviada')
+    linhas = []
+    for det in deteccoes:
+        confianca = float(det['confidence'])
+        if not math.isfinite(confianca) or not 0 <= confianca <= 1:
+            raise ValueError('Confianca invalida da deteccao')
+        if confianca < conf_min:
+            continue
+        classe_original = int(det['id'])
+        if classe_original not in ids:
+            raise ValueError(f'API retornou classe nao selecionada: {classe_original}')
+        xyxy = det.get('xyxy')
+        if not isinstance(xyxy, (list, tuple)) or len(xyxy) != 4:
+            raise ValueError('BBox xyxy ausente ou invalida')
+        valores = [float(v) for v in xyxy]
+        if not all(math.isfinite(v) for v in valores):
+            raise ValueError('BBox com coordenadas nao finitas')
+        x1, y1, x2, y2 = valores
+        if x1 >= x2 or y1 >= y2:
+            raise ValueError('BBox com dimensoes nao positivas')
+        x1, x2 = max(0., min(x1, largura)), max(0., min(x2, largura))
+        y1, y2 = max(0., min(y1, altura)), max(0., min(y2, altura))
+        if x2 <= x1 or y2 <= y1:
+            raise ValueError('BBox fora dos limites da imagem')
+        cx, cy = (x1+x2)/(2*largura), (y1+y2)/(2*altura)
+        w, h = (x2-x1)/largura, (y2-y1)/altura
+        linhas.append(f'{ids[classe_original]} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}')
+    return linhas
+
+
+def nome_dataset(rel: Path, categoria: str) -> str:
+    """Nome seguro, preserva identificacao de camera e evita nomes iguais."""
+    limpa = re.sub(r'[^A-Za-z0-9_-]+', '_', rel.stem).strip('_')[:50] or 'imagem'
+    digest = hashlib.sha256(str(rel).casefold().encode('utf-8')).hexdigest()[:12]
+    return f'{categoria}__{limpa}__{digest}.jpg'
+
+
+def gravar_atomico(path: Path, conteudo: bytes):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporario = path.with_name(path.name + '.' + uuid.uuid4().hex + '.part')
+    try:
+        with temporario.open('xb') as f:
+            f.write(conteudo)
+            f.flush()
+            os.fsync(f.fileno())
+        if path.exists():
+            raise FileExistsError(f'Arquivo de dataset ja existe: {path}')
+        os.rename(temporario, path)
+    finally:
+        temporario.unlink(missing_ok=True)
+
+
+def fechar_dataset(dataset: Path, classes: list[str]) -> Path:
+    """Fecha pacote de revisao CVAT/Ultralytics com arquivos realmente criados."""
+    imagens = sorted((dataset/'images'/'train').glob('*.jpg'))
+    if not imagens:
+        return None
+    train_txt = '\n'.join('images/train/' + p.name for p in imagens) + '\n'
+    (dataset/'train.txt').write_text(train_txt, encoding='utf-8')
+    yaml_text = ('path: .\ntrain: train.txt\nnames:\n' +
+                 ''.join(f'  {i}: {json.dumps(name, ensure_ascii=False)}\n' for i,name in enumerate(classes)))
+    (dataset/'data.yaml').write_text(yaml_text, encoding='utf-8')
+    (dataset/'classes.txt').write_text('\n'.join(classes) + '\n', encoding='utf-8')
+    archive = dataset.parent/(dataset.name + '.zip')
+    temporario = archive.with_suffix('.zip.part')
+    try:
+        with zipfile.ZipFile(temporario, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+            for p in dataset.rglob('*'):
+                if p.is_file():
+                    z.write(p, p.relative_to(dataset).as_posix())
+        os.replace(temporario, archive)
+    finally:
+        temporario.unlink(missing_ok=True)
+    return archive
 
 
 def nome_livre(pasta: Path, nome: str) -> Path:
@@ -259,7 +366,7 @@ def processar(config: Config, registrar: Callable[[str], None] = print,
     pasta_relatorios.mkdir(parents=True, exist_ok=True)
     caminho_csv = pasta_relatorios / f'{"simulacao_" if config.simular else "triagem_"}{execucao}.csv'
     contador = {name: 0 for name in PASTAS}
-    contador.update(erro=0, cancelado=0)
+    contador.update(erro=0, cancelado=0, anotadas=0, caixas_anotadas=0)
     realizados = 0
     registrar(f'{len(imagens)} imagens encontradas. Modo: {"SIMULACAO (nao move)" if config.simular else "MOVER ORIGINAIS"}.')
     if not imagens:
@@ -267,6 +374,9 @@ def processar(config: Config, registrar: Callable[[str], None] = print,
     api = api or APIColab(config)
     registrar('Conectando ao Colab e preparando modelo...')
     info = api.iniciar()
+    mapa_classes, nomes_classes = classes_dataset(config, info) if config.gerar_anotacoes else ({}, [])
+    dataset = (destino / 'datasets_yolo' / ('dataset_' + execucao)) if config.gerar_anotacoes and not config.simular else None
+    arquivo_dataset_zip = None
     registrar(f'Modelo pronto: {info.get("model", config.modelo)} | dispositivo: {info.get("device", "?")}')
 
     # Em execucao real, evita dois processos gravando na mesma pasta em paralelo.
@@ -282,7 +392,8 @@ def processar(config: Config, registrar: Callable[[str], None] = print,
         with caminho_csv.open('w', newline='', encoding='utf-8-sig') as csv_file:
             writer = csv.DictWriter(csv_file, fieldnames=CAMPOS)
             writer.writeheader()
-            def salvar(path, pasta='', resposta=None, erro='', status='ok', dest=''):
+            def salvar(path, pasta='', resposta=None, erro='', status='ok', dest='',
+                       anotacao_txt='', imagem_dataset='', anotacao_gerada=False):
                 nonlocal realizados
                 resposta = resposta or {}
                 dets = resposta.get('detections', [])
@@ -293,7 +404,9 @@ def processar(config: Config, registrar: Callable[[str], None] = print,
                              num_deteccoes=len(dets), classes=', '.join(classes),
                              deteccoes_json=json.dumps(dets, ensure_ascii=False), erro=erro,
                              modelo=config.modelo, confianca_minima=config.conf_min,
-                             confianca_alta=config.conf_alta, simulacao=config.simular)
+                             confianca_alta=config.conf_alta, simulacao=config.simular,
+                             anotacao_gerada=anotacao_gerada, anotacao_txt=str(anotacao_txt),
+                             imagem_dataset=str(imagem_dataset))
                 writer.writerow(linha)
                 csv_file.flush()
                 os.fsync(csv_file.fileno())
@@ -344,16 +457,46 @@ def processar(config: Config, registrar: Callable[[str], None] = print,
                         rel = p.relative_to(origem)
                         pasta_dest = destino / pasta / rel.parent
                         novo = nome_livre(pasta_dest, p.name)
+                        # Retangulos do modelo estao na escala da imagem JPEG enviada.
+                        # Copiamos EXATAMENTE esse JPEG ao dataset; por isso os labels
+                        # sempre correspondem, inclusive EXIF, PNG e imagens grandes.
+                        rotulos = []
+                        if config.gerar_anotacoes and pasta != 'sem_deteccoes':
+                            dados_jpeg = next(dados for origem_jpeg, dados in validas if origem_jpeg == p)
+                            with Image.open(io.BytesIO(dados_jpeg)) as imagem_convertida:
+                                dimensoes = imagem_convertida.size
+                            rotulos = rotulos_yolo(dets, mapa_classes, *dimensoes, config.conf_min)
+                            if not rotulos:
+                                raise ValueError('Detectado mas nenhuma bbox valida para anotacao; imagem preservada.')
+                        anotacao_txt = ''
+                        imagem_dataset = ''
                         if not config.simular:
-                            # Imagem alterada desde o upload? Impede mover versao diferente.
                             stat_atual = p.stat()
                             if (stat_atual.st_size, stat_atual.st_mtime_ns) != estados[p]:
                                 raise RuntimeError('Arquivo original foi alterado durante inferencia; mantido na origem.')
-                            mover_com_verificacao(p, novo)
+                            if rotulos and dataset is not None:
+                                identificador = nome_dataset(rel, pasta)
+                                imagem_dataset = dataset/'images'/'train'/identificador
+                                anotacao_txt = dataset/'labels'/'train'/Path(identificador).with_suffix('.txt')
+                                try:
+                                    gravar_atomico(imagem_dataset, dados_jpeg)
+                                    gravar_atomico(anotacao_txt, ('\n'.join(rotulos)+'\n').encode('utf-8'))
+                                    mover_com_verificacao(p, novo)
+                                except Exception:
+                                    Path(imagem_dataset).unlink(missing_ok=True)
+                                    Path(anotacao_txt).unlink(missing_ok=True)
+                                    raise
+                            else:
+                                mover_com_verificacao(p, novo)
                         salvar(p, pasta=pasta, resposta=resposta, dest=novo,
-                               status='simulado' if config.simular else 'movido')
+                               status='simulado' if config.simular else 'movido',
+                               anotacao_txt=anotacao_txt, imagem_dataset=imagem_dataset,
+                               anotacao_gerada=bool(rotulos and not config.simular))
                         contador[pasta] += 1
-                        registrar(f'[{pasta.upper()}] {rel} (conf {confianca:.1%})')
+                        if rotulos and not config.simular:
+                            contador['anotadas'] += 1
+                            contador['caixas_anotadas'] += len(rotulos)
+                        registrar(f'[{pasta.upper()}] {rel} (conf {confianca:.1%}; boxes={len(rotulos)})')
                     except Exception as exc:
                         salvar(p, resposta=resposta, erro=str(exc), status='erro')
                         contador['erro'] += 1
@@ -363,8 +506,18 @@ def processar(config: Config, registrar: Callable[[str], None] = print,
         if lock_fd is not None:
             os.close(lock_fd)
             trava.unlink(missing_ok=True)
+        # Mesmo apos falha de API, disponibiliza as imagens ja triadas em ZIP parcial.
+        if dataset is not None and (dataset/'images'/'train').exists():
+            try:
+                arquivo_dataset_zip = fechar_dataset(dataset, nomes_classes)
+                if arquivo_dataset_zip:
+                    registrar(f'[DATASET CVAT/YOLO] {arquivo_dataset_zip}')
+            except Exception as exc:
+                registrar(f'[AVISO] Falha ao empacotar dataset; arquivos permanecem em {dataset}: {exc}')
     resumo = dict(total=len(imagens), processadas=realizados, contagem=contador,
                   csv=str(caminho_csv), origem=str(origem), destino=str(destino),
-                  modelo=config.modelo, execucao=execucao, simulacao=config.simular)
+                  modelo=config.modelo, execucao=execucao, simulacao=config.simular,
+                  dataset_zip=str(arquivo_dataset_zip) if arquivo_dataset_zip else "",
+                  pasta_dataset=str(dataset) if dataset and dataset.exists() else "")
     registrar('Finalizado: ' + json.dumps(contador, ensure_ascii=False))
     return resumo
