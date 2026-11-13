@@ -33,7 +33,7 @@ class Aplicativo(tk.Tk):
         self.recursivo = tk.BooleanVar(value=True)
         self.simular = tk.BooleanVar(value=True)
         self.gerar_anotacoes = tk.BooleanVar(value=True)
-        self.status = tk.StringVar(value='Pronto. Primeiro teste em simulacao (25 imagens).')
+        self.status = tk.StringVar(value='Pronto.')
         self.progress = tk.DoubleVar(value=0)
         self.criar_layout()
         self.after(120, self.ler_eventos)
@@ -101,7 +101,6 @@ class Aplicativo(tk.Tk):
         self.log.pack(side='left',fill='both',expand=True)
         barra.pack(side='right',fill='y')
         self.logar('Instruções: execute notebook v7 (compatível com V8) no Colab, copie a URL e X-API-Key para esta janela.')
-        self.logar('Recomendação: mantenha SIMULAÇÃO marcada e limite 25 no primeiro teste.')
 
     def logar(self, mensagem):
         self.log.insert('end',mensagem+'\n')
